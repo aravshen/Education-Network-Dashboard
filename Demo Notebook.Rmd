@@ -1,0 +1,741 @@
+---
+title: "RISE Performance Task"
+author: "Aravind Shenoy"
+date: "March 4, 2019"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: united
+    toc_float: true
+    df_print: paged
+runtime: shiny
+---
+
+# Import the Datasets
+
+Import some libraries and set the path
+
+```{r message=FALSE}
+library(dplyr)
+library(tidyr)
+library(reshape2)
+library(plotly)
+library(highcharter)
+library(googlesheets)
+
+#path = "C:/Users/Aravind/Desktop/RISE/"
+```
+
+Let us read in the datasets
+
+```{r}
+attendance <- read.table("Attendance_data.txt", sep=',', header = T, stringsAsFactors = F)
+academic <- read.table("Academic_data.txt", sep='\t', header=T, stringsAsFactors = F)
+general <- read.table("General_student_data.txt", sep='|', header=T, stringsAsFactors = F)
+```
+
+Take a peek at the datasets
+
+```{r, rows.print=7}
+renderDataTable({
+    attendance %>% head()
+}, options = list(pageLength=7))
+```
+
+```{r, rows.print=7}
+renderDataTable({
+    academic %>% head()
+}, options = list(pageLength=7))
+```
+
+```{r, rows.print=7}
+renderDataTable({
+    general %>% head()
+}, options = list(pageLength=7))
+```
+
+# Data Cleaning
+
+Let us do some data cleaning and manipulation on the datasets so that they are in a usable form
+
+## General Dataset
+
+The dataset has two columns, namely 'marker' and 'binary.marker', that are entirely filled with NAs. Let us drop those columns
+
+```{r}
+general <- general[, 1:3]
+```
+
+## Academic Dataset
+
+Take a look at the grade column. Some of the entries seemed to have an underscore.
+
+```{r}
+unique(academic$grade)
+```
+
+We need to remove any underscores, trim whitespaces, and convert any "plus" to "+", and minus to "-"
+This is easy to do with simple regexes. I will also use the pipe operator '%>%' from maggritr throughout as it makes the code a lot more readable, and helps me avoid writing nested functions.
+
+```{r}
+academic$grade <- academic$grade %>% 
+    trimws() %>% 
+    gsub("plus", "+", .) %>% 
+    gsub("minus", "-", .) %>% 
+    gsub("[^A-DF+-]", "", .)
+```
+
+We notice that there are 'NA' entries for grades. Let us take a look at those students
+
+```{r}
+renderTable({
+    academic[academic$grade %>% is.na() %>% which(), ]
+})
+```
+
+let us also take a look at the unique student ids that are present in this dataset
+
+```{r}
+renderDataTable({
+    academic %>% group_by(id, sy) %>% summarize(num_subjects = n()) %>% arrange(sy, id)
+}, options = list(pageLength=7))
+```
+
+We see that student ids 2 and 3 are <b>MISSING</b> for both years.
+
+## Attendance dataset
+
+let us now do some manipulation on the attendance dataset. Convert the date column to 'date' type and 'att_binary' column to numeric
+
+```{r}
+attendance$date <- as.Date(attendance$date)
+attendance$att_binary <- attendance$att_binary %>% as.numeric()
+```
+
+Take a look at the attendances for students in both years
+
+```{r}
+renderDataTable({
+    attendance %>% group_by(id, sy) %>% summarise(days_attended=sum(att_binary)) %>% arrange(sy, id)
+}, options = list(pageLength=7))
+```
+
+We see that students 2 and 3 did not attend the summer programs for both years. NOTE THAT THESE STUDENTS ALSO DID NOT HAVE RECORDS IN THE ACADEMIC DATASET. This means that we can drop them from consideration for calculation of on-track performance. I would also contact the school teacher responsible to clear up the exact details about the situation.
+
+We also see that students 5 and 17 did not have any attendance records for both year 1 and 2. We are going to calculate the on-track performance metric on the assumption that their attendance rate = 0%.
+
+# Sanity Checks
+
+Let us perform some sanity checks on the datasets
+
+### Check 1
+
+Check to see if every student has the same start and end dates
+
+```{r}
+renderDataTable({
+attendance %>% 
+    group_by(id, sy) %>% 
+    summarise(num_entries = n(), start_date = first(date), end_date = last(date))
+}, options = list(pageLength=7))
+```
+
+We see that all students have the same number of days = 60 days for both Year 1 and Year 2.
+
+### Check 2
+
+Check to see the number of schools each kid attended per year, using attendance dataset
+
+```{r}
+renderDataTable({
+attendance %>%
+    group_by(id, sy) %>%
+    summarize(num_schools = unique(school_name) %>% length())
+}, options = list(pageLength=7))
+```
+
+### Check 3
+
+Check to see the number of schools each kid attended per year, using academic dataset
+
+```{r}
+renderDataTable({
+academic %>%
+    group_by(id, sy) %>%
+    summarize(num_schools = unique(school_name) %>% length())
+}, options = list(pageLength=7))
+```
+
+Both of these check out
+
+### Check 4
+
+make sure that the school names are the same in general and academic datasets by student id. They all check out (no mismatches)
+
+```{r}
+temp <- left_join(academic, general, by='id')
+temp[temp$sy == '02SUM', 'school_name'] != temp[temp$sy == '02SUM', 'current_school']
+```
+
+### Check 5
+
+count the number of subjects each student has a record for in the academic dataset
+
+```{r}
+renderDataTable({
+academic %>% group_by(id, sy) %>%
+    summarize(num_subjects = sum(!is.na(grade))) %>%
+    arrange(sy, id)
+}, options = list(pageLength=7))
+```
+
+We see that for student id 10 (pg. 3), records for English and Science are not present for Year 2. Rather than dropping this student (and lose information about 2 subjects and their attendance), we are going to compute the gpa based on 2 subjects available. The on-track performance metric will be based on this.
+
+# Assumptions
+
+1. Student ids 2 and 3 have no records in the academic and attendance datasets. They are going to be dropped as it would not be possible to compute their on track performance.
+
+2. Students 5 and 17 did not have any records in the attendance dataset. Their on-track performance metric is going to be computed based on the assumption that their attendance is 0%.
+
+3. Student id 10 has no records present for English and Science Year 2 in the academic dataset. We are going to compute the gpa based on data for 2 subjects available. The on-track performance metric will be based on this.
+
+4. Grade Categories(not scientific) : GPA between 0.0 - 2.0 (Low); between 2.0 - 3.0 (Medium); More than 3.0 (High)
+
+5. Attendance Categories (also not scientific) : 90 -100 % Attendance = 0 - 1 Week Absence; 67 - 90 % Attendance = 1-3 Weeks Absence; < 67 % Attendance = More than 3 Weeks Absence. (Assuming total number of days = 60)
+
+# Data Manipulation
+
+## Grade Points
+Let us start by converting the grade letters to points in the academic dataset. I'm going to use the conversion table provided in the pdf file.
+
+```{r}
+grade <- c('A+', 'A', 'A-', 'B+', 'B', 'B-', 'C+', 'C', 'C-', 'D+', 'D', 'D-', 'F')
+grade_points <- c(4.0, 4.0, 3.7, 3.3, 3, 2.7, 2.3, 2, 1.7, 1.3, 1, 0.7, 0)
+
+grades <- as.data.frame(cbind(grade, grade_points), stringsAsFactors = F)
+grades$grade_points <- grades$grade_points %>% as.numeric()
+```
+
+Join this with the academic dataset
+```{r}
+academic <- left_join(academic, grades, by='grade')
+```
+
+```{r}
+renderTable({
+    head(academic)
+})
+```
+
+## Learning Style
+
+Join with the general dataset to get learning styles. Note that this would not retain learning styles for student ids 2 and 3
+
+```{r}
+academic <- left_join(academic, general[, c("id", "learning_style")], by='id')
+```
+
+
+## Calculate GPA
+
+```{r}
+academic_gpa <- academic %>% group_by(id, sy, school_name, learning_style) %>% 
+    summarize(gpa=mean(grade_points, na.rm = T),
+              gpa_esm = mean(grade_points[1:3], na.rm = T),
+              gpa_sm = mean(grade_points[c(1,3)], na.rm = T),
+              gpa_ea = mean(grade_points[c(2,4)], na.rm = T))
+```
+
+* gpa_esm = gpa calculated for only english, science, and math
+* gpa_sm = gpa calculated for only science and math
+* gpa_ea = gpa calculated for only english and arts
+
+## Attendance percentages.
+
+Note that I have hard-coded the number of days =60 in my calculation, since it is much simpler to do it in this case. For real datasets, however, this needs to be replaced by an actual variable as numbers might vary.
+
+```{r}
+attendance_percent <- attendance %>% 
+    group_by(id, sy) %>% 
+    summarize(attendance_rate = sum(att_binary)/60*100)
+```
+
+Join academic_gpa with attendance_percent
+
+```{r}
+academic_gpa <- left_join(academic_gpa, attendance_percent, by=c('id', 'sy'))
+```
+
+## Column for On-track performance
+
+```{r}
+academic_gpa$on_track <- "Vulnerable"
+academic_gpa[academic_gpa$gpa >= 3 & 
+                 academic_gpa$attendance_rate >= 90 &
+                 !is.na(academic_gpa$attendance_rate), "on_track"] <- "On-Track"
+academic_gpa[academic_gpa$gpa < 3 & 
+                 academic_gpa$attendance_rate < 90 &
+                 !is.na(academic_gpa$attendance_rate), "on_track"] <- "Off-Track"
+```
+
+deal with those rows where attendance_rate is NA (student id 5 and 17)
+
+```{r}
+academic_gpa[is.na(academic_gpa$attendance_rate) &
+                 academic_gpa$gpa < 3, "on_track"] <- "Off-Track"
+```
+
+Take a look at the dataset
+
+```{r}
+renderDataTable({
+    academic_gpa
+}, options = list(pageLength=7))
+```
+
+Let us convert the dataset into wide-format so that gpa and attendance for each year have a separate column. This format is preferred by some plotting libraries.
+
+## Melt and Recast
+
+```{r}
+combined <- academic_gpa %>% 
+    melt(id = c("id", "sy"), measured=c("gpa", "attendance_rate", "on_track", "learning_style", 
+                                        "school_name", "gpa_esm", "gpa_sm", "gpa_ea")) %>% 
+    arrange(id, sy, variable) %>% 
+    mutate(variable = paste0(variable, "_", sy)) %>% 
+    select(id, variable, value) %>%
+    dcast(id ~ variable) %>% 
+    select(-c(learning_style_01SUM)) %>% 
+    rename(learning_style=learning_style_02SUM)
+```
+
+convert to numeric
+```{r}
+for (i in 2:11)
+    combined[, i] <- combined[, i] %>% as.numeric()
+```
+
+## Growth in GPA
+```{r}
+combined$growth <- combined$gpa_02SUM - combined$gpa_01SUM
+```
+
+```{r}
+renderDataTable({
+    combined
+}, options = list(pageLength=7))
+```
+
+# Question 1.
+
+Determine the on-track distribution for each high school's students. Specifically, how many students fall
+into each category?
+
+For year 1:
+
+```{r}
+renderTable({
+combined %>% group_by(on_track_01SUM) %>% 
+    summarize(count = n()) %>%
+    mutate(percent = paste0(round(count/sum(count), 3)*100, "%"))
+})
+```
+
+For year 2:
+
+```{r}
+renderTable({
+combined %>% filter(school_name_02SUM == 'Jupiter HS') %>% group_by(school_name_02SUM, on_track_02SUM) %>% 
+    summarize(count = n()) %>% 
+    mutate(percent = paste0(count/sum(count)*100, "%"))
+})
+```
+
+```{r}
+renderTable({
+combined %>% filter(school_name_02SUM == 'Venus HS') %>% group_by(school_name_02SUM, on_track_02SUM) %>% 
+    summarize(count = n()) %>% 
+    mutate(percent = paste0(count/sum(count)*100, "%"))
+})
+```
+
+```{r echo=FALSE}
+selectInput("school_1", label = "Select School:",
+            choices = c("Mercury MS", "Jupiter HS", "Venus HS"), selected = "Mercury MS")
+renderHighchart({
+    if(input$school_1 == "Mercury MS") {
+        temp_1 <- combined[, c("id", "on_track_01SUM", "learning_style")]
+        temp_1$on_track <- temp_1$on_track_01SUM
+    } else {
+        temp_1 <- combined[, c("id", "on_track_02SUM", "learning_style", "school_name_02SUM")]
+        temp_1$on_track <- temp_1$on_track_02SUM
+        temp_1 <- temp_1[temp_1$school_name_02SUM == input$school_1, ]
+    }
+    temp_1 <- temp_1 %>% group_by(on_track) %>% summarize(num_of_students = n()) 
+    temp_1$on_track = factor(temp_1$on_track, levels=c("On-Track", "Vulnerable", "Off-Track"))
+    temp_1 <- temp_1[order(temp_1$on_track), ]
+    hchart(temp_1, "column", hcaes(x=on_track, y=num_of_students, color=on_track)) %>%
+        hc_yAxis(allowDecimals=F) %>% hc_plotOptions(column=list(dataLabels=list(enabled=TRUE))) %>%
+        hc_title(text="On-Track Performance")
+})
+```
+
+# Question 2:
+
+Provide a list of student IDs for students whose on-track status has changed and what that change is.
+
+```{r}
+renderDataTable({
+    temp_2 <- combined[combined$on_track_01SUM != combined$on_track_02SUM, c("id", "on_track_01SUM", "on_track_02SUM")]
+    temp_2
+})
+```
+
+Write this list to google docs
+```{r}
+library(googlesheets)
+#Uncomment the code to write to google sheets
+
+#gs_auth(new_user = T)
+
+#gs_new(title = "RISE Demo", ws_title = "Sheet 1", input = temp_2)
+```
+
+# Question 3:
+
+Many of our partners understand analysis better when it is presented visually. Create a one page
+visualization for each high school showing the on-track status of its 9th graders grouped by their 8th grade
+on-track status. Label your visualizations such that it can be understood without you there to talk
+someone through it.
+
+I thought the best way to address this would be through a Sankey diagram.
+
+```{r echo=FALSE}
+
+selectInput("school_2", label = "Select School:",
+            choices = c("Jupiter HS", "Venus HS"), selected = "Jupiter HS")
+temp2 <- reactive({
+    temp_2 <- combined[combined$school_name_02SUM == input$school_2, ]
+    temp_2 <- temp_2 %>% group_by(on_track_01SUM, on_track_02SUM) %>% summarize(num_students = n())
+    temp_2$on_track_01SUM = factor(temp_2$on_track_01SUM, levels=c("On-Track", "Vulnerable", "Off-Track"))
+    temp_2$on_track_02SUM = factor(temp_2$on_track_02SUM, levels=c("On-Track", "Vulnerable", "Off-Track"))
+    temp_2 <- temp_2[order(temp_2$on_track_01SUM, temp_2$on_track_02SUM), ]
+    temp_2[temp_2$on_track_01SUM == "On-Track", "color"] <- "#BFE0A0"
+    temp_2[temp_2$on_track_01SUM == "Vulnerable", "color"] <- "#FCDD89"
+    temp_2[temp_2$on_track_01SUM == "Off-Track", "color"] <- "#FEF1E9"
+    return(temp_2)
+})
+
+renderPlotly({
+    
+    temp <- temp2()
+    temp_21 <- temp %>% group_by(on_track_01SUM) %>% summarize(n=sum(num_students))
+    temp_22 <- temp %>% group_by(on_track_02SUM) %>% summarize(n=sum(num_students))
+    
+    p <- plot_ly(
+        type = "sankey",
+        orientation = "h",
+        valueformat = ".0f",
+        valuesuffix = " Students",
+        showlegend = T,
+        
+        node = list(
+            label = c(unique(temp2()$on_track_01SUM) %>% levels() %>% 
+                          paste0(., "(2001) :", temp_21$n, " Students"), 
+                      unique(temp2()$on_track_02SUM) %>% levels() %>% 
+                          paste0(., "(2002) :", temp_22$n, " Students")),
+            color = c("#7FC241", "#FABC13", "#F27420", "#7FC241", "#FABC13", "#F27420"),
+            pad = 15,
+            thickness = 20,
+            line = list(
+                color = "black",
+                width = 0.5
+            ),
+            hoverinfo = list(enumerated="skip")
+        ),
+        
+        link = list(
+            source = temp2()$on_track_01SUM %>% as.integer() -1,
+            target = temp2()$on_track_02SUM %>% as.integer() +2,
+            value =  temp2()$num_students,
+            color = temp2()$color
+        )
+    ) %>% 
+        layout(
+            title = "Movement of On-Track Performance from 2001 to 2002 Summer",
+            font = list(
+                size = 10
+            )
+        )
+    p
+})
+```
+
+# Question 4:
+
+As a data analyst, you like to provide districts with insight beyond what they request, especially if that
+insight could be used to help students. Create one additional visualization that could be used to
+familiarize educators with something interesting you discovered in the data. Label your visualization such
+that it can be understood without you there to talk someone through it.
+
+Let us explore some visualizations to gather some insights.
+
+## Learning Type vs. On Track Performance
+
+```{r echo=FALSE}
+selectInput("school_3", label = "Select School:",
+            choices = c("Mercury MS", "Jupiter HS", "Venus HS"), selected = "Mercury MS")
+
+renderPlotly({
+    if(input$school_3 == "Mercury MS") {
+        temp_3 <- combined[, c("id", "on_track_01SUM", "learning_style")]
+        temp_3$on_track <- temp_3$on_track_01SUM
+    } else {
+        temp_3 <- combined[, c("id", "on_track_02SUM", "learning_style", "school_name_02SUM")]
+        temp_3$on_track <- temp_3$on_track_02SUM
+        temp_3 <- temp_3[temp_3$school_name_02SUM == input$school_3, ]
+    }
+    
+    temp_3 <- temp_3 %>% group_by(learning_style, on_track) %>% summarize(num_of_students = n())
+    temp_3$Style <- "Visual"
+    temp_3[temp_3$learning_style == 'A', "Style"] <- "Auditory"
+    temp_3[temp_3$learning_style == 'K', "Style"] <- "Kinesthetic"
+    temp_3[temp_3$learning_style == 'L', "Style"] <- "Linguistic"
+    
+    temp_3 <- temp_3 %>% arrange(learning_style)
+    temp_3 <- temp_3[, c("Style", "on_track", "num_of_students")]
+    temp_3 <- temp_3 %>% spread(Style, num_of_students)
+    
+    if((temp_3 %>% colnames() %>% length()) == 4)
+        temp_3$Linguistic <- NA
+    
+    p <- plot_ly(temp_3) %>%
+    add_trace(x = ~on_track, y = ~Auditory, name = 'Auditory', 
+              width=0.2, type = 'bar', text = ~Auditory, textposition = 'auto') %>%
+    add_trace(x = ~on_track, y = ~Kinesthetic, name = 'Kinesthetic', 
+              width=0.2, type = 'bar', text = ~Kinesthetic, textposition = 'auto') %>%
+    add_trace(x = ~on_track, y = ~Linguistic, name = 'Linguistic', 
+              width=0.2, type = 'bar', text = ~Linguistic, textposition = 'auto') %>%
+    add_trace(x = ~on_track, y = ~Visual, name = 'Visual', 
+              width=0.2, type = 'bar', text = ~Visual, textposition = 'auto') %>%
+    layout(yaxis = list(title = 'Number of Students', dtick=1), title="On track performance vs Learning Styles (Number of Students)")
+p
+})
+```
+
+## Learning Style vs GPA
+
+```{r echo=FALSE}
+
+selectInput("school_4", label = "Select School:",
+            choices = c("Jupiter HS", "Venus HS"), selected = "Jupiter HS")
+selectInput("gpa_4", label = "Select GPA type:",
+            choices = c("GPA(Overall)", "GPA(Sci+Math)", "GPA(Eng+Arts)", "GPA(Eng+Sci+Math)"), 
+            selected = "GPA(Overall)")
+renderPlotly({
+    temp_4 <- combined[combined$school_name_02SUM == input$school_4, ]
+    if(input$gpa_4 == "GPA(Overall)") {
+        temp_4$GPA_Year1 <- temp_4$gpa_01SUM
+        temp_4$GPA_Year2 <- temp_4$gpa_02SUM
+    } else if(input$gpa_4 == "GPA(Sci+Math)") {
+        temp_4$GPA_Year1 <- temp_4$gpa_sm_01SUM
+        temp_4$GPA_Year2 <- temp_4$gpa_sm_02SUM
+    }
+    else if(input$gpa_4 == "GPA(Eng+Arts)") {
+        temp_4$GPA_Year1 <- temp_4$gpa_ea_01SUM
+        temp_4$GPA_Year2 <- temp_4$gpa_ea_02SUM
+    }
+    else {
+        temp_4$GPA_Year1 <- temp_4$gpa_esm_01SUM
+        temp_4$GPA_Year2 <- temp_4$gpa_esm_02SUM
+    }
+    
+    temp_4 <- temp_4 %>% group_by(learning_style) %>% 
+        summarize(Average_GPA_Year1=mean(GPA_Year1,na.rm=T) %>% round(2), 
+                  Average_GPA_Year2=mean(GPA_Year2,na.rm=T) %>% round(2))
+    
+    temp_4$Style <- "Visual"
+    temp_4[temp_4$learning_style == 'A', "Style"] <- "Auditory"
+    temp_4[temp_4$learning_style == 'K', "Style"] <- "Kinesthetic"
+    temp_4[temp_4$learning_style == 'L', "Style"] <- "Linguistic"
+    
+    p <- plot_ly(temp_4) %>%
+    add_trace(x = ~Style, y = ~Average_GPA_Year1, name = 'Year 1', 
+              width=0.3, type = 'bar', text = ~Average_GPA_Year1, textposition = 'auto') %>%
+    add_trace(x = ~Style, y = ~Average_GPA_Year2, name = 'Year 2', 
+              width=0.3, type = 'bar', text = ~Average_GPA_Year2, textposition = 'auto') %>%
+    layout(title="Learning Styles vs. GPA")
+    p
+})
+
+```
+
+## Absenteeism Category vs. Learning Type
+
+```{r echo=FALSE}
+selectInput("school_5", label = "Select School:",
+            choices = c("Jupiter HS", "Venus HS"), selected = "Jupiter HS")
+
+renderPlotly({
+    
+    temp_5 <- combined[combined$school_name_02SUM == input$school_5, ]
+    temp_5$Absenteeism_Cat <- "0 to 1 Week"
+    temp_5[is.na(temp_5$attendance_rate_02SUM), "attendance_rate_02SUM"] <- 0
+    temp_5[temp_5$attendance_rate_02SUM >= 67 & temp_5$attendance_rate_02SUM <90, "Absenteeism_Cat"] <- "1 to 3 Weeks"
+    temp_5[temp_5$attendance_rate_02SUM <67, "Absenteeism_Cat"] <- "More than 3 Weeks"
+    
+    temp_5 <- temp_5 %>% group_by(learning_style, Absenteeism_Cat) %>% summarize(num_students=n())
+    
+    temp_5$Style <- "Visual"
+    temp_5[temp_5$learning_style == 'A', "Style"] <- "Auditory"
+    temp_5[temp_5$learning_style == 'K', "Style"] <- "Kinesthetic"
+    temp_5[temp_5$learning_style == 'L', "Style"] <- "Linguistic"
+    
+    p <- plot_ly(temp_5, x = ~Style, y = ~Absenteeism_Cat, 
+                 type = 'scatter', mode = 'markers+text', text=~num_students, textposition='auto',
+        marker = list(size = ~num_students*30, opacity = 0.5, color=~num_students)) %>%
+    layout(title = 'Learning Styles vs Absenteeism (Number of Students)',
+         xaxis = list(showgrid = T, title=''),
+         yaxis = list(showgrid = T, title='')) %>% config(displayModeBar=F)
+    
+    p
+    
+})
+```
+
+## Grade in Year 2 vs. Grade Year 1
+
+```{r echo=FALSE}
+selectInput("school_6", label = "Select School:",
+            choices = c("Jupiter HS", "Venus HS"), selected = "Jupiter HS")
+selectInput("gpa_6", label = "Select GPA type:",
+            choices = c("GPA(Overall)", "GPA(Sci+Math)", "GPA(Eng+Arts)", "GPA(Eng+Sci+Math)"), 
+            selected = "GPA(Overall)")
+
+renderPlotly({
+    
+    temp_6 <- combined[combined$school_name_02SUM == input$school_6, ]
+    if(input$gpa_6 == "GPA(Overall)") {
+        temp_6$GPA_Year1 <- temp_6$gpa_01SUM
+        temp_6$GPA_Year2 <- temp_6$gpa_02SUM
+    } else if(input$gpa_6 == "GPA(Sci+Math)") {
+        temp_6$GPA_Year1 <- temp_6$gpa_sm_01SUM
+        temp_6$GPA_Year2 <- temp_6$gpa_sm_02SUM
+    }
+    else if(input$gpa_6 == "GPA(Eng+Arts)") {
+        temp_6$GPA_Year1 <- temp_6$gpa_ea_01SUM
+        temp_6$GPA_Year2 <- temp_6$gpa_ea_02SUM
+    }
+    else {
+        temp_6$GPA_Year1 <- temp_6$gpa_esm_01SUM
+        temp_6$GPA_Year2 <- temp_6$gpa_esm_02SUM
+    }
+    p <- plot_ly(temp_6, x = ~GPA_Year1, y = ~gpa_02SUM, 
+                 type = 'scatter', mode = 'markers+text',
+        marker = list(size = 10, opacity = 0.3, color=~GPA_Year2)) %>%
+    layout(title = 'GPA Year 2 vs GPA Year 1',
+         xaxis = list(showgrid = T, title='GPA Year 1'),
+         yaxis = list(showgrid = T, title='GPA Year 2')) %>% config(displayModeBar=F)
+    
+    p
+    
+})
+```
+
+## Grade Category vs. Attendance
+
+```{r echo=FALSE}
+selectInput("school_7", label = "Select School:",
+            choices = c("Jupiter HS", "Venus HS"), selected = "Jupiter HS")
+
+renderPlotly({
+    
+    temp_7 <- combined[combined$school_name_02SUM == input$school_7, ]
+    temp_7$Absenteeism_Cat <- "0 to 1 Week"
+    temp_7[is.na(temp_7$attendance_rate_02SUM), "attendance_rate_02SUM"] <- 0
+    temp_7[temp_7$attendance_rate_02SUM >= 67 & temp_7$attendance_rate_02SUM <90, "Absenteeism_Cat"] <- "1 to 3 Weeks"
+    temp_7[temp_7$attendance_rate_02SUM <67, "Absenteeism_Cat"] <- "> 3 Weeks"
+    
+    temp_7$GPA <- "GPA (0-2)"
+    temp_7[temp_7$gpa_02SUM > 2 & temp_7$gpa_02SUM < 3, "GPA"] <- "GPA (2-3)"
+    temp_7[temp_7$gpa_02SUM >= 3, "GPA"] <- "GPA (>3)"
+    
+    temp_7 <- temp_7[order(factor(temp_7$GPA, levels=c("GPA (0-2)", "GPA (2-3)", "GPA (>3)")), 
+                           factor(temp_7$Absenteeism_Cat, levels=c("0 to 1 Week", "1 to 3 Weeks", "> 3 Weeks"))), ]
+    
+    temp_7 <- temp_7 %>% group_by(GPA, Absenteeism_Cat) %>% summarize(num_students=n())
+    
+    p <- plot_ly(temp_7, x = ~GPA, y = ~Absenteeism_Cat, 
+                 type = 'scatter', mode = 'markers+text', text=~num_students, textposition='auto',
+        marker = list(size = ~num_students*30, opacity = 0.5, color=~num_students)) %>%
+    layout(title = 'GPA vs Absenteeism (in Number of Students)',
+         xaxis = list(showgrid = T, title='Overall GPA'),
+         yaxis = list(showgrid = T, title='Number of Days Absent')) %>% config(displayModeBar=F)
+    
+    p
+    
+})
+```
+
+## Distribution of Grades by School
+
+
+```{r echo=FALSE}
+selectInput("school_8", label = "Select School:",
+            choices = c("Jupiter HS", "Venus HS"), selected = "Jupiter HS")
+
+renderHighchart({
+    
+    temp_8 <- combined[combined$school_name_02SUM == input$school_8, ]
+    
+    temp_8$GPA <- "GPA (0-2)"
+    temp_8[temp_8$gpa_02SUM > 2 & temp_8$gpa_02SUM < 3, "GPA"] <- "GPA (2-3)"
+    temp_8[temp_8$gpa_02SUM >= 3, "GPA"] <- "GPA (>3)"
+    
+    temp_8 <- temp_8 %>% group_by(GPA) %>% summarize(num_students=n())
+    temp_8 <- temp_8[order(factor(temp_8$GPA, levels=c("GPA (>3)", "GPA (2-3)", "GPA (0-2)"))), ]
+    
+    hchart(temp_8, "column", hcaes(x=GPA, y=num_students, color=num_students)) %>%
+        hc_yAxis(allowDecimals=F) %>% hc_plotOptions(column=list(dataLabels=list(enabled=TRUE))) %>%
+        hc_title(text="GPA Performance by School (Number of Students)")
+    
+})
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
